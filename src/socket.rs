@@ -1,9 +1,10 @@
 use crate::proto::{RecvMeta, SocketType, Transmit, UdpCapabilities};
-use async_io::Async;
 use futures_lite::future::poll_fn;
 use std::io::{IoSliceMut, Result};
 use std::net::SocketAddr;
+use std::os::fd::{AsRawFd, RawFd};
 use std::task::{Context, Poll};
+use tokio::net::UdpSocket as TokioUdpSocket;
 
 #[cfg(unix)]
 use crate::unix as platform;
@@ -12,7 +13,8 @@ use fallback as platform;
 
 #[derive(Debug)]
 pub struct UdpSocket {
-    inner: Async<std::net::UdpSocket>,
+    inner: TokioUdpSocket,
+    fd: RawFd,
     ty: SocketType,
 }
 
@@ -26,8 +28,10 @@ impl UdpSocket {
     pub fn bind(addr: SocketAddr) -> Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)?;
         let ty = platform::init(&socket)?;
+        let fd = socket.as_raw_fd();
         Ok(Self {
-            inner: Async::new(socket)?,
+            inner: TokioUdpSocket::from_std(socket)?,
+            fd,
             ty,
         })
     }
@@ -37,26 +41,25 @@ impl UdpSocket {
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.inner.get_ref().local_addr()
+        self.inner.local_addr()
     }
 
     pub fn ttl(&self) -> Result<u8> {
-        let ttl = self.inner.get_ref().ttl()?;
+        let ttl = self.inner.ttl()?;
         Ok(ttl as u8)
     }
 
     pub fn set_ttl(&self, ttl: u8) -> Result<()> {
-        self.inner.get_ref().set_ttl(ttl as u32)
+        self.inner.set_ttl(ttl as u32)
     }
 
     pub fn poll_send(&self, cx: &mut Context, transmits: &[Transmit]) -> Poll<Result<usize>> {
-        match self.inner.poll_writable(cx) {
+        match self.inner.poll_send_ready(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
         }
-        let socket = self.inner.get_ref();
-        match platform::send(socket, transmits) {
+        match platform::send(self.fd, transmits) {
             Ok(len) => Poll::Ready(Ok(len)),
             Err(err) => Poll::Ready(Err(err)),
         }
@@ -68,13 +71,12 @@ impl UdpSocket {
         buffers: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<Result<usize>> {
-        match self.inner.poll_readable(cx) {
+        match self.inner.poll_recv_ready(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
         }
-        let socket = self.inner.get_ref();
-        Poll::Ready(platform::recv(socket, buffers, meta))
+        Poll::Ready(platform::recv(self.fd, buffers, meta))
     }
 
     pub async fn send(&self, transmits: &[Transmit]) -> Result<usize> {
@@ -110,7 +112,7 @@ mod fallback {
         })
     }
 
-    pub fn send(socket: &std::net::UdpSocket, transmits: &[Transmit]) -> Result<usize> {
+    pub fn send(socket: &TokioUdpSocket, transmits: &[Transmit]) -> Result<usize> {
         let mut sent = 0;
         for transmit in transmits {
             match socket.send_to(&transmit.contents, &transmit.destination) {
@@ -132,7 +134,7 @@ mod fallback {
     }
 
     pub fn recv(
-        socket: &std::net::UdpSocket,
+        socket: &TokioUdpSocket,
         buffers: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Result<usize> {
