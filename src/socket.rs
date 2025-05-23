@@ -95,7 +95,19 @@ impl UdpSocket {
             }
         }
     }
-
+    pub fn try_read_mmsg(
+        &self,
+        buffers: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Result<usize> {
+        self.inner.try_io(Interest::READABLE, || {
+            platform::recv(self.fd, buffers, meta)
+        })
+    }
+    pub fn try_write_mmsg(&self, transmits: &[Transmit<'_>]) -> Result<usize> {
+        self.inner
+            .try_io(Interest::WRITABLE, || platform::send(self.fd, transmits))
+    }
     pub fn poll_recv(
         &self,
         cx: &mut Context,
