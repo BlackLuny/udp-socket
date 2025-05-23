@@ -42,12 +42,9 @@ impl UdpSocket {
     pub fn bind(addr: SocketAddr) -> Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)?;
         let ty = platform::init(&socket)?;
-        let fd = socket.as_raw_fd();
-        Ok(Self {
-            inner: TokioUdpSocket::from_std(socket)?,
-            fd,
-            ty,
-        })
+        let inner = TokioUdpSocket::from_std(socket)?;
+        let fd = inner.as_raw_fd();
+        Ok(Self { inner, fd, ty })
     }
 
     pub fn socket_type(&self) -> SocketType {
