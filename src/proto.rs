@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::{borrow::Cow, net::{IpAddr, Ipv6Addr, SocketAddr}};
 
 /// The capabilities a UDP socket supports on a certain platform.
 #[derive(Clone, Copy, Debug)]
@@ -11,13 +11,13 @@ pub struct UdpCapabilities {
 
 /// An outgoing packet
 #[derive(Debug)]
-pub struct Transmit {
+pub struct Transmit<'a> {
     /// The socket this datagram should be sent to.
     pub destination: SocketAddr,
     /// Explicit congestion notification bits to set on the packet.
     pub ecn: Option<EcnCodepoint>,
     /// Contents of the datagram.
-    pub contents: Vec<u8>,
+    pub contents: Cow<'a, [u8]>,
     /// The segment size if this transmission contains multiple datagrams.
     /// This is `None` if the transmit only contains a single datgram.
     pub segment_size: Option<usize>,

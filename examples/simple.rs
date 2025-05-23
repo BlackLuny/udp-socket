@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::io::IoSliceMut;
+use std::{borrow::Cow, io::IoSliceMut};
 use std::net::Ipv4Addr;
 use std::time::Instant;
 use udp_socket::{EcnCodepoint, RecvMeta, Transmit, UdpSocket, BATCH_SIZE};
@@ -17,7 +17,7 @@ fn main() -> Result<()> {
             destination: addr2,
             ecn: Some(EcnCodepoint::CE),
             segment_size: Some(1200),
-            contents,
+            contents: Cow::Owned(contents),
             src_ip: Some(Ipv4Addr::LOCALHOST.into()),
         });
     }

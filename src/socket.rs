@@ -53,7 +53,7 @@ impl UdpSocket {
         self.inner.set_ttl(ttl as u32)
     }
 
-    pub fn poll_send(&self, cx: &mut Context, transmits: &[Transmit]) -> Poll<Result<usize>> {
+    pub fn poll_send(&self, cx: &mut Context, transmits: &[Transmit<'_>]) -> Poll<Result<usize>> {
         match self.inner.poll_send_ready(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Pending => return Poll::Pending,
@@ -79,7 +79,7 @@ impl UdpSocket {
         Poll::Ready(platform::recv(self.fd, buffers, meta))
     }
 
-    pub async fn send(&self, transmits: &[Transmit]) -> Result<usize> {
+    pub async fn send(&self, transmits: &[Transmit<'_>]) -> Result<usize> {
         let mut i = 0;
         while i < transmits.len() {
             i += poll_fn(|cx| self.poll_send(cx, &transmits[i..])).await?;
@@ -112,7 +112,7 @@ mod fallback {
         })
     }
 
-    pub fn send(socket: &TokioUdpSocket, transmits: &[Transmit]) -> Result<usize> {
+    pub fn send(socket: &TokioUdpSocket, transmits: &[Transmit<'_>]) -> Result<usize> {
         let mut sent = 0;
         for transmit in transmits {
             match socket.send_to(&transmit.contents, &transmit.destination) {
