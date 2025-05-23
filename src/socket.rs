@@ -2,6 +2,7 @@ use crate::proto::{RecvMeta, SocketType, Transmit, UdpCapabilities};
 use futures_lite::future::poll_fn;
 use std::io::{IoSliceMut, Result};
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
 use std::task::{Context, Poll};
 use tokio::net::UdpSocket as TokioUdpSocket;
@@ -16,6 +17,19 @@ pub struct UdpSocket {
     inner: TokioUdpSocket,
     fd: RawFd,
     ty: SocketType,
+}
+
+impl Deref for UdpSocket {
+    type Target = TokioUdpSocket;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for UdpSocket {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }
 
 impl UdpSocket {
