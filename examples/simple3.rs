@@ -1,6 +1,6 @@
 use anyhow::Result;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Deref;
 use std::time::Instant;
 use std::{borrow::Cow, io::IoSliceMut};
@@ -11,7 +11,7 @@ fn opt_socket() -> Result<UdpSocket> {
     socket.set_send_buffer_size(8 * 1024 * 1024)?;
     socket.set_recv_buffer_size(8 * 1024 * 1024)?;
     socket.set_nonblocking(true)?;
-    socket.bind(&SockAddr::from(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))?;
+    socket.bind(&SockAddr::from(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))))?;
 
     Ok(UdpSocket::from_socket(socket)?)
     // Ok(UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?)
@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         let contents = (i as u64).to_be_bytes().to_vec();
         transmits.push(Transmit {
             destination: addr2,
-            ecn: None,
+            ecn: Some(EcnCodepoint::CE),
             segment_size: Some(1200),
             contents: Cow::Owned(contents),
             src_ip: None,
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
     let task1 = tokio::spawn(async move {
         log::debug!("before send");
         for i in 0..10000 {
-            socket1.deref().send(&[i as u8; 1200]).await.unwrap();
+            socket1.deref().send_to(&[i as u8; 1200], addr2).await.unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         log::debug!("after send");

@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 tokio = {version = "1", features=["full"]}
 futures-lite = "1.11.3"
-libc = "0.2.92"
+libc = "0"
 socket2 = "0"
 
 [dev-dependencies]

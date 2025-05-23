@@ -1,5 +1,9 @@
+use libc::{sockaddr_in, sockaddr_in6, sockaddr_storage};
+use socket2::SockAddr;
+
 use crate::proto::{EcnCodepoint, RecvMeta, SocketType, Transmit};
 use crate::{cmsg, BATCH_SIZE};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::{
     io,
     io::IoSliceMut,
@@ -373,6 +377,26 @@ fn prepare_recv(
     hdr.msg_flags = 0;
 }
 
+fn sockaddr_storage_to_socketaddr(storage: &sockaddr_storage) -> Option<SocketAddr> {
+    unsafe {
+        match storage.ss_family as i32 {
+            AF_INET => {
+                let addr: &sockaddr_in = &*(storage as *const _ as *const sockaddr_in);
+                let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+                let port = u16::from_be(addr.sin_port);
+                Some(SocketAddr::new(ip.into(), port))
+            }
+            AF_INET6 => {
+                let addr: &sockaddr_in6 = &*(storage as *const _ as *const sockaddr_in6);
+                let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
+                let port = u16::from_be(addr.sin6_port);
+                Some(SocketAddr::new(ip.into(), port))
+            }
+            _ => None,
+        }
+    }
+}
+
 fn decode_recv(
     name: &MaybeUninit<libc::sockaddr_storage>,
     hdr: &libc::msghdr,
@@ -411,12 +435,7 @@ fn decode_recv(
             _ => {}
         }
     }
-
-    let source = match libc::c_int::from(name.ss_family) {
-        libc::AF_INET => unsafe { SocketAddr::V4(ptr::read(&name as *const _ as _)) },
-        libc::AF_INET6 => unsafe { SocketAddr::V6(ptr::read(&name as *const _ as _)) },
-        _ => unreachable!(),
-    };
+    let source = sockaddr_storage_to_socketaddr(&name).unwrap();
 
     RecvMeta {
         source,
