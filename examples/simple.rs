@@ -6,13 +6,14 @@ use std::{borrow::Cow, io::IoSliceMut};
 use udp_socket::{EcnCodepoint, RecvMeta, Transmit, UdpSocket, BATCH_SIZE};
 
 fn opt_socket() -> Result<UdpSocket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_send_buffer_size(8192)?;
-    socket.set_recv_buffer_size(8192)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&SockAddr::from(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))?;
+    // let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    // socket.set_send_buffer_size(8192)?;
+    // socket.set_recv_buffer_size(8192)?;
+    // socket.set_nonblocking(true)?;
+    // socket.bind(&SockAddr::from(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))?;
 
-    Ok(UdpSocket::from_socket(socket)?)
+    // Ok(UdpSocket::from_socket(socket)?)
+    Ok(UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?)
 }
 
 #[tokio::main]
@@ -27,22 +28,25 @@ async fn main() -> Result<()> {
         let contents = (i as u64).to_be_bytes().to_vec();
         transmits.push(Transmit {
             destination: addr2,
-            ecn: Some(EcnCodepoint::CE),
+            ecn: None,
             segment_size: Some(1200),
             contents: Cow::Owned(contents),
-            src_ip: Some(Ipv4Addr::LOCALHOST.into()),
+            src_ip: None,
         });
     }
 
-    let task1 = async_global_executor::spawn(async move {
+    let task1 = tokio::spawn(async move {
         log::debug!("before send");
         for i in 0..1000 {
             socket1.send(&transmits).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         log::debug!("after send");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     });
 
-    let task2 = async_global_executor::spawn(async move {
+    let task2 = tokio::spawn(async move {
+        let mut cnt = 0;
         loop {
             let mut storage = [[0u8; 1200]; BATCH_SIZE];
             let mut buffers = Vec::with_capacity(BATCH_SIZE);
@@ -63,19 +67,20 @@ async fn main() -> Result<()> {
                     &meta[i]
                 );
             }
+            cnt += n;
+            println!("total received {} packets", cnt);
         }
     });
 
-    async_global_executor::block_on(async move {
-        let start = Instant::now();
-        task1.await;
-        task2.await;
-        println!(
-            "sent {} packets in {}ms",
-            BATCH_SIZE,
-            start.elapsed().as_millis()
-        );
-    });
+    let start = Instant::now();
+    task1.await;
+    task2.await;
+    println!(
+        "sent {} packets in {}ms",
+        BATCH_SIZE,
+        start.elapsed().as_millis()
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     Ok(())
 }
