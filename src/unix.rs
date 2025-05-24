@@ -1,4 +1,4 @@
-use libc::{sockaddr_in, sockaddr_in6, sockaddr_storage};
+use libc::{sockaddr_in, sockaddr_in6, sockaddr_storage, AF_INET, AF_INET6};
 use socket2::SockAddr;
 
 use crate::proto::{EcnCodepoint, RecvMeta, SocketType, Transmit};

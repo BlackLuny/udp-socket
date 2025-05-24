@@ -1,16 +1,17 @@
 use anyhow::Result;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Instant;
 use std::{borrow::Cow, io::IoSliceMut};
 use udp_socket::{EcnCodepoint, RecvMeta, Transmit, UdpSocket, BATCH_SIZE};
 
 fn opt_socket() -> Result<UdpSocket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(false)?;
     socket.set_send_buffer_size(8192)?;
     socket.set_recv_buffer_size(8192)?;
     socket.set_nonblocking(true)?;
-    socket.bind(&SockAddr::from(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))?;
+    socket.bind(&SockAddr::from(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))))?;
 
     Ok(UdpSocket::from_socket(socket)?)
     // Ok(UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?)
@@ -28,10 +29,10 @@ async fn main() -> Result<()> {
         let contents = (i as u64).to_be_bytes().to_vec();
         transmits.push(Transmit {
             destination: addr2,
-            ecn: Some(EcnCodepoint::CE),
-            segment_size: Some(1200),
+            ecn: None,
+            segment_size:None,
             contents: Cow::Owned(contents),
-            src_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            src_ip: None,
         });
     }
 
