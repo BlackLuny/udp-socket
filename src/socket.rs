@@ -4,7 +4,7 @@ use socket2::Socket;
 use std::io::{IoSliceMut, Result};
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::task::{Context, Poll};
 use tokio::io::Interest;
 use tokio::net::UdpSocket as TokioUdpSocket;
@@ -17,7 +17,6 @@ use fallback as platform;
 #[derive(Debug)]
 pub struct UdpSocket {
     inner: TokioUdpSocket,
-    fd: RawFd,
     ty: SocketType,
 }
 
@@ -45,16 +44,14 @@ impl UdpSocket {
         let socket = std::net::UdpSocket::bind(addr)?;
         let ty = platform::init(&socket)?;
         let inner = TokioUdpSocket::from_std(socket)?;
-        let fd = inner.as_raw_fd();
-        Ok(Self { inner, fd, ty })
+        Ok(Self { inner, ty })
     }
 
     pub fn from_socket(socket: Socket) -> Result<Self> {
         let socket = std::net::UdpSocket::from(socket);
         let ty = platform::init(&socket)?;
         let inner = TokioUdpSocket::from_std(socket)?;
-        let fd = inner.as_raw_fd();
-        Ok(Self { inner, fd, ty })
+        Ok(Self { inner, ty })
     }
 
     pub fn socket_type(&self) -> SocketType {
@@ -81,10 +78,9 @@ impl UdpSocket {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
             }
-            match self
-                .inner
-                .try_io(Interest::WRITABLE, || platform::send(self.fd, transmits))
-            {
+            match self.inner.try_io(Interest::WRITABLE, || {
+                platform::send(self.inner.as_raw_fd(), transmits)
+            }) {
                 Ok(count) => return Poll::Ready(Ok(count)),
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -101,12 +97,13 @@ impl UdpSocket {
         meta: &mut [RecvMeta],
     ) -> Result<usize> {
         self.inner.try_io(Interest::READABLE, || {
-            platform::recv(self.fd, buffers, meta)
+            platform::recv(self.inner.as_raw_fd(), buffers, meta)
         })
     }
     pub fn try_write_mmsg(&self, transmits: &[Transmit<'_>]) -> Result<usize> {
-        self.inner
-            .try_io(Interest::WRITABLE, || platform::send(self.fd, transmits))
+        self.inner.try_io(Interest::WRITABLE, || {
+            platform::send(self.inner.as_raw_fd(), transmits)
+        })
     }
     pub fn poll_recv(
         &self,
@@ -121,7 +118,7 @@ impl UdpSocket {
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
             }
             match self.inner.try_io(Interest::READABLE, || {
-                platform::recv(self.fd, buffers, meta)
+                platform::recv(self.inner.as_raw_fd(), buffers, meta)
             }) {
                 Ok(count) => return Poll::Ready(Ok(count)),
                 Err(err) => {
