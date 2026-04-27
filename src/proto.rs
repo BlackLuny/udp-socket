@@ -36,6 +36,12 @@ pub struct RecvMeta {
     pub ecn: Option<EcnCodepoint>,
     /// Optional destination IP address of the datagram.
     pub dst_ip: Option<IpAddr>,
+    /// GRO segment size when the kernel coalesced multiple datagrams into a
+    /// single receive (Linux `UDP_GRO`). Zero means no coalescing happened —
+    /// the buffer contains a single datagram of `len` bytes. When non-zero,
+    /// the buffer holds `ceil(len / stride)` original datagrams, each of size
+    /// `stride` except possibly the final one (which may be shorter).
+    pub stride: usize,
 }
 
 impl Default for RecvMeta {
@@ -45,6 +51,7 @@ impl Default for RecvMeta {
             len: 0,
             ecn: None,
             dst_ip: None,
+            stride: 0,
         }
     }
 }

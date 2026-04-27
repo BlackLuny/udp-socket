@@ -62,6 +62,35 @@ impl UdpSocket {
         self.inner.local_addr()
     }
 
+    /// Enable / disable Linux `UDP_GRO`. When enabled, the kernel may coalesce
+    /// multiple datagrams from the same flow into a single recv. Each
+    /// resulting `RecvMeta::stride` reports the original segment size so the
+    /// caller can split the buffer back into per-datagram views.
+    ///
+    /// On non-Linux platforms this is a no-op and returns `Ok(())`.
+    /// Returns the underlying `setsockopt` error on Linux when the kernel
+    /// does not support `UDP_GRO` (kernels older than 5.0).
+    pub fn set_gro(&self, enabled: bool) -> Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let on: libc::c_int = if enabled { 1 } else { 0 };
+            let rc = unsafe {
+                libc::setsockopt(
+                    self.inner.as_raw_fd(),
+                    libc::SOL_UDP,
+                    libc::UDP_GRO,
+                    &on as *const _ as _,
+                    std::mem::size_of_val(&on) as _,
+                )
+            };
+            if rc == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        let _ = enabled; // silence unused on non-linux
+        Ok(())
+    }
+
     pub fn ttl(&self) -> Result<u8> {
         let ttl = self.inner.ttl()?;
         Ok(ttl as u8)
@@ -196,6 +225,7 @@ mod fallback {
             len,
             ecn: None,
             dst_ip: None,
+            stride: 0,
         };
         Ok(1)
     }

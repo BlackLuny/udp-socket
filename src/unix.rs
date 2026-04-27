@@ -295,7 +295,9 @@ pub fn recv<I: AsRawFd>(
     Ok(1)
 }
 
-const CMSG_LEN: usize = 88;
+// 88 was tight even before UDP_GRO; bump to 128 so that ECN + PKTINFO + UDP_GRO
+// cmsgs all fit comfortably without MSG_CTRUNC.
+const CMSG_LEN: usize = 128;
 
 fn prepare_msg(
     transmit: &Transmit,
@@ -405,6 +407,9 @@ fn decode_recv(
     let name = unsafe { name.assume_init() };
     let mut ecn_bits = 0;
     let mut dst_ip = None;
+    // mut is unused on platforms without UDP_GRO (anything but linux/android).
+    #[allow(unused_mut)]
+    let mut stride: usize = 0;
 
     let cmsg_iter = unsafe { cmsg::Iter::new(hdr) };
     for cmsg in cmsg_iter {
@@ -432,6 +437,13 @@ fn decode_recv(
                 let pktinfo = cmsg::decode::<libc::in6_pktinfo>(cmsg);
                 dst_ip = Some(IpAddr::V6(ptr::read(&pktinfo.ipi6_addr as *const _ as _)));
             },
+            // Linux UDP_GRO: kernel reports the segment size used to coalesce
+            // multiple datagrams into one receive. Only delivered when the
+            // socket has UDP_GRO enabled via setsockopt.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            (libc::SOL_UDP, libc::UDP_GRO) => unsafe {
+                stride = cmsg::decode::<u16>(cmsg) as usize;
+            },
             _ => {}
         }
     }
@@ -442,6 +454,7 @@ fn decode_recv(
         len,
         ecn: EcnCodepoint::from_bits(ecn_bits),
         dst_ip,
+        stride,
     }
 }
 
