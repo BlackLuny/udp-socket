@@ -439,7 +439,8 @@ fn sockaddr_storage_to_socketaddr(storage: &sockaddr_storage) -> Option<SocketAd
                 let addr: &sockaddr_in6 = &*(storage as *const _ as *const sockaddr_in6);
                 let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
                 let port = u16::from_be(addr.sin6_port);
-                Some(SocketAddr::new(ip.into(), port))
+                Some(SocketAddr::V6(std::net::SocketAddrV6::new(ip, port,
+                    addr.sin6_flowinfo, addr.sin6_scope_id)))
             }
             _ => None,
         }
@@ -533,4 +534,18 @@ pub fn max_gso_segments() -> io::Result<usize> {
 #[cfg(not(target_os = "linux"))]
 pub fn max_gso_segments() -> io::Result<usize> {
     Ok(1)
+}
+
+#[cfg(test)]
+mod address_tests {
+    #[test]
+    fn receive_source_preserves_ipv6_zone_and_flowinfo() {
+        let expected = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1234".parse().unwrap(), 4321, 17, 9));
+        let addr = socket2::SockAddr::from(expected);
+        let mut storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
+        unsafe { std::ptr::copy_nonoverlapping(addr.as_ptr().cast::<u8>(),
+            (&mut storage as *mut libc::sockaddr_storage).cast::<u8>(), addr.len() as usize); }
+        assert_eq!(super::sockaddr_storage_to_socketaddr(&storage), Some(expected));
+    }
 }
