@@ -138,6 +138,20 @@ impl UdpSocket {
         })
     }
 
+    /// Receive a datagram with truncation detection, without ancillary metadata.
+    /// Requires UDP_GRO disabled. Use `try_read_one` for ECN, destination IP or GRO.
+    #[cfg(unix)]
+    pub fn try_read_datagram(&self, buffer: &mut [u8]) -> Result<crate::DatagramMeta> {
+        Self::try_read_datagram_from(&self.inner, buffer)
+    }
+
+    /// Same contract as `try_read_datagram`, for an existing Tokio socket.
+    /// Does not change socket options; the caller must keep UDP_GRO disabled.
+    #[cfg(unix)]
+    pub fn try_read_datagram_from(socket: &TokioUdpSocket, buffer: &mut [u8]) -> Result<crate::DatagramMeta> {
+        socket.try_io(Interest::READABLE, || platform::recv_datagram(socket.as_raw_fd(), buffer))
+    }
+
     /// Receive one datagram without losing the kernel's truncation flag.
     #[cfg(unix)]
     pub fn try_read_one(&self, buffer: &mut [u8]) -> Result<RecvMeta> {

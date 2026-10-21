@@ -5,7 +5,7 @@ use udp_socket::{RecvMeta, UdpSocket};
 #[tokio::test]
 async fn exact_capacity_zero_length_and_oversize_are_distinct() {
     for ip in ["127.0.0.1:0", "[::1]:0"] {
-        for single in [false, true] {
+        for mode in 0..3 {
             let raw = match std::net::UdpSocket::bind(ip) {
                 Ok(raw) => raw,
                 Err(e) if ip.starts_with('[') && e.kind() == std::io::ErrorKind::AddrNotAvailable => {
@@ -21,7 +21,18 @@ async fn exact_capacity_zero_length_and_oversize_are_distinct() {
             for size in [0, 127, 128, 129, 6000, 60000, 7] {
                 sender.send_to(&vec![size as u8; size], target).await.unwrap();
                 let mut buf = [0; 128];
-                let meta = if single {
+                let meta = if mode == 2 {
+                    loop {
+                        socket.readable().await.unwrap();
+                        match socket.try_read_datagram(&mut buf) {
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                            result => {
+                                let m = result.unwrap();
+                                break RecvMeta { source: m.source, len: m.len, truncated: m.truncated, ..Default::default() };
+                            }
+                        }
+                    }
+                } else if mode == 1 {
                     socket.recv_one(&mut buf).await.unwrap()
                 } else {
                     let mut meta = [RecvMeta::default()];
@@ -29,7 +40,7 @@ async fn exact_capacity_zero_length_and_oversize_are_distinct() {
                     assert_eq!(n, 1);
                     meta[0]
                 };
-                assert_eq!(meta.truncated, size > 128, "{ip} single={single} size={size}");
+                assert_eq!(meta.truncated, size > 128, "{ip} mode={mode} size={size}");
                 assert_eq!(meta.len, size.min(128));
                 assert_eq!(&buf[..meta.len], &vec![size as u8; meta.len]);
                 assert_eq!(meta.source, sender.local_addr().unwrap());
@@ -93,5 +104,25 @@ async fn explicit_pmtu_policy_is_applied_at_final_initialization() {
             assert_eq!(unsafe{libc::getsockopt(receiver.as_raw_fd(),level,option,(&mut value as *mut libc::c_int).cast(),&mut len)},0);
             assert_eq!(value,expected);
         }
+    }
+}
+
+#[tokio::test]
+async fn zero_capacity_datagram_buffer_still_consumes_exactly_one_packet() {
+    let raw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    raw.set_nonblocking(true).unwrap();
+    let receiver = UdpSocket::from_socket(raw.into()).unwrap();
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    for size in [0, 1, 60000, 0] {
+        sender.send_to(&vec![7; size], receiver.local_addr().unwrap()).unwrap();
+        let meta = loop {
+            receiver.readable().await.unwrap();
+            match receiver.try_read_datagram(&mut []) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                result => break result.unwrap(),
+            }
+        };
+        assert_eq!((meta.len, meta.truncated), (0, size != 0));
+        assert_eq!(meta.source, sender.local_addr().unwrap());
     }
 }

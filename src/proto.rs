@@ -29,6 +29,16 @@ pub struct Transmit<'a> {
     pub src_ip: Option<IpAddr>,
 }
 
+/// A single datagram on a socket with UDP_GRO disabled, without ancillary data.
+#[derive(Clone, Copy, Debug)]
+pub struct DatagramMeta {
+    pub source: SocketAddr,
+    /// Number of bytes copied to the receive buffer.
+    pub len: usize,
+    /// The original datagram was larger than the receive buffer.
+    pub truncated: bool,
+}
+
 /// An incoming packet
 #[derive(Clone, Copy, Debug)]
 pub struct RecvMeta {

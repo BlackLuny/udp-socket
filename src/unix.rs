@@ -280,7 +280,38 @@ pub fn recv<I: AsRawFd>(
     Ok(msg_count as usize)
 }
 
-/// Single-datagram recvmsg path, including flags (recvfrom loses MSG_TRUNC).
+/// Receive one datagram without ancillary metadata. The caller must keep GRO off.
+/// Linux input MSG_TRUNC returns the original datagram length even if the buffer
+/// is smaller. This retains recvfrom's cost while distinguishing exact fit.
+pub fn recv_datagram<I: AsRawFd>(io: I, buffer: &mut [u8]) -> io::Result<crate::DatagramMeta> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut name = unsafe { mem::zeroed::<sockaddr_storage>() };
+        let n = loop {
+            let mut len = mem::size_of_val(&name) as libc::socklen_t;
+            let n = unsafe { libc::recvfrom(io.as_raw_fd(), buffer.as_mut_ptr().cast(),
+                buffer.len(), libc::MSG_TRUNC, (&mut name as *mut sockaddr_storage).cast(), &mut len) };
+            if n == -1 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted { continue; }
+                return Err(e);
+            }
+            break n as usize;
+        };
+        let source = sockaddr_storage_to_socketaddr(&name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown UDP source family"))?;
+        Ok(crate::DatagramMeta { source, len: n.min(buffer.len()), truncated: n > buffer.len() })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let mut meta = [RecvMeta::default()];
+        recv_one(io, &mut [IoSliceMut::new(buffer)], &mut meta)?;
+        let m = meta[0];
+        Ok(crate::DatagramMeta { source: m.source, len: m.len, truncated: m.truncated })
+    }
+}
+
+/// Single-datagram recvmsg path, including flags and ancillary metadata.
 pub fn recv_one<I: AsRawFd>(
     io: I,
     bufs: &mut [IoSliceMut<'_>],
