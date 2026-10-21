@@ -1,5 +1,4 @@
 use libc::{sockaddr_in, sockaddr_in6, sockaddr_storage, AF_INET, AF_INET6};
-use socket2::SockAddr;
 
 use crate::proto::{EcnCodepoint, RecvMeta, SocketType, Transmit};
 use crate::{cmsg, BATCH_SIZE};
@@ -19,6 +18,17 @@ type IpTosTy = libc::c_uchar;
 type IpTosTy = libc::c_int;
 
 pub fn init(io: &UdpSocket) -> io::Result<SocketType> {
+    init_with_pmtu(io, crate::PmtuPolicy::Probe)
+}
+
+pub fn init_with_pmtu(io: &UdpSocket, policy: crate::PmtuPolicy) -> io::Result<SocketType> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let pmtu: libc::c_int = match policy {
+        crate::PmtuPolicy::Probe => libc::IP_PMTUDISC_PROBE,
+        crate::PmtuPolicy::AllowFragmentation => libc::IP_PMTUDISC_DONT,
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = policy;
     let mut cmsg_platform_space = 0;
     if cfg!(target_os = "linux") {
         cmsg_platform_space +=
@@ -68,8 +78,8 @@ pub fn init(io: &UdpSocket) -> io::Result<SocketType> {
                     io.as_raw_fd(),
                     libc::IPPROTO_IP,
                     libc::IP_MTU_DISCOVER,
-                    &libc::IP_PMTUDISC_PROBE as *const _ as _,
-                    mem::size_of_val(&libc::IP_PMTUDISC_PROBE) as _,
+                    &pmtu as *const _ as _,
+                    mem::size_of_val(&pmtu) as _,
                 )
             };
             if rc == -1 {
@@ -113,8 +123,8 @@ pub fn init(io: &UdpSocket) -> io::Result<SocketType> {
                     io.as_raw_fd(),
                     libc::IPPROTO_IPV6,
                     libc::IPV6_MTU_DISCOVER,
-                    &libc::IP_PMTUDISC_PROBE as *const _ as _,
-                    mem::size_of_val(&libc::IP_PMTUDISC_PROBE) as _,
+                    &pmtu as *const _ as _,
+                    mem::size_of_val(&pmtu) as _,
                 )
             };
             if rc == -1 {
@@ -233,7 +243,10 @@ pub fn recv<I: AsRawFd>(
     let mut names = [MaybeUninit::<libc::sockaddr_storage>::uninit(); BATCH_SIZE];
     let mut ctrls = [cmsg::Aligned(MaybeUninit::<[u8; CMSG_LEN]>::uninit()); BATCH_SIZE];
     let mut hdrs = unsafe { mem::zeroed::<[libc::mmsghdr; BATCH_SIZE]>() };
-    let max_msg_count = bufs.len().min(BATCH_SIZE);
+    let max_msg_count = bufs.len().min(meta.len()).min(BATCH_SIZE);
+    if max_msg_count == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "UDP receive needs a buffer and metadata"));
+    }
     for i in 0..max_msg_count {
         prepare_recv(
             &mut bufs[i],
@@ -247,7 +260,7 @@ pub fn recv<I: AsRawFd>(
             libc::recvmmsg(
                 io.as_raw_fd(),
                 hdrs.as_mut_ptr(),
-                bufs.len().min(BATCH_SIZE) as libc::c_uint,
+                max_msg_count as libc::c_uint,
                 0,
                 ptr::null_mut(),
             )
@@ -267,12 +280,15 @@ pub fn recv<I: AsRawFd>(
     Ok(msg_count as usize)
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-pub fn recv<I: AsRawFd>(
+/// Single-datagram recvmsg path, including flags (recvfrom loses MSG_TRUNC).
+pub fn recv_one<I: AsRawFd>(
     io: I,
     bufs: &mut [IoSliceMut<'_>],
     meta: &mut [RecvMeta],
 ) -> io::Result<usize> {
+    if bufs.is_empty() || meta.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "UDP receive needs a buffer and metadata"));
+    }
     let mut name = MaybeUninit::<libc::sockaddr_storage>::uninit();
     let mut ctrl = cmsg::Aligned(MaybeUninit::<[u8; CMSG_LEN]>::uninit());
     let mut hdr = unsafe { mem::zeroed::<libc::msghdr>() };
@@ -286,14 +302,14 @@ pub fn recv<I: AsRawFd>(
             }
             return Err(e);
         }
-        if hdr.msg_flags & libc::MSG_TRUNC != 0 {
-            continue;
-        }
         break n;
     };
     meta[0] = decode_recv(&name, &hdr, n as usize);
     Ok(1)
 }
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub use recv_one as recv;
 
 // 88 was tight even before UDP_GRO; bump to 128 so that ECN + PKTINFO + UDP_GRO
 // cmsgs all fit comfortably without MSG_CTRUNC.
@@ -452,6 +468,7 @@ fn decode_recv(
     RecvMeta {
         source,
         len,
+        truncated: hdr.msg_flags & libc::MSG_TRUNC != 0,
         ecn: EcnCodepoint::from_bits(ecn_bits),
         dst_ip,
         stride,

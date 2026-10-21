@@ -1,5 +1,9 @@
 use std::{borrow::Cow, net::{IpAddr, Ipv6Addr, SocketAddr}};
 
+/// Linux PMTU policy applied once, during final socket initialization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PmtuPolicy { Probe, AllowFragmentation }
+
 /// The capabilities a UDP socket supports on a certain platform.
 #[derive(Clone, Copy, Debug)]
 pub struct UdpCapabilities {
@@ -32,6 +36,9 @@ pub struct RecvMeta {
     pub source: SocketAddr,
     /// Length of the payload of the packet.
     pub len: usize,
+    /// The kernel discarded part of this datagram. `len` is only the copied
+    /// prefix, never a complete UDP payload. Callers must discard this entry.
+    pub truncated: bool,
     /// Explicit congestion notification bits set on the packet.
     pub ecn: Option<EcnCodepoint>,
     /// Optional destination IP address of the datagram.
@@ -49,6 +56,7 @@ impl Default for RecvMeta {
         Self {
             source: SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
             len: 0,
+            truncated: false,
             ecn: None,
             dst_ip: None,
             stride: 0,

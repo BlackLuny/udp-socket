@@ -54,6 +54,14 @@ impl UdpSocket {
         Ok(Self { inner, ty })
     }
 
+    #[cfg(unix)]
+    pub fn from_socket_with_pmtu(socket: Socket, policy: crate::PmtuPolicy) -> Result<Self> {
+        let socket = std::net::UdpSocket::from(socket);
+        let ty = platform::init_with_pmtu(&socket, policy)?;
+        let inner = TokioUdpSocket::from_std(socket)?;
+        Ok(Self { inner, ty })
+    }
+
     pub fn socket_type(&self) -> SocketType {
         self.ty
     }
@@ -128,6 +136,33 @@ impl UdpSocket {
         self.inner.try_io(Interest::READABLE, || {
             platform::recv(self.inner.as_raw_fd(), buffers, meta)
         })
+    }
+
+    /// Receive one datagram without losing the kernel's truncation flag.
+    #[cfg(unix)]
+    pub fn try_read_one(&self, buffer: &mut [u8]) -> Result<RecvMeta> {
+        Self::try_read_one_from(&self.inner, buffer)
+    }
+
+    /// Read flags from an existing Tokio socket without changing its options.
+    #[cfg(unix)]
+    pub fn try_read_one_from(socket: &TokioUdpSocket, buffer: &mut [u8]) -> Result<RecvMeta> {
+        let mut meta = [RecvMeta::default()];
+        socket.try_io(Interest::READABLE, || {
+            platform::recv_one(socket.as_raw_fd(), &mut [IoSliceMut::new(buffer)], &mut meta)
+        })?;
+        Ok(meta[0])
+    }
+
+    #[cfg(unix)]
+    pub async fn recv_one(&self, buffer: &mut [u8]) -> Result<RecvMeta> {
+        loop {
+            self.inner.readable().await?;
+            match self.try_read_one(buffer) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                result => return result,
+            }
+        }
     }
     pub fn try_write_mmsg(&self, transmits: &[Transmit<'_>]) -> Result<usize> {
         self.inner.try_io(Interest::WRITABLE, || {
@@ -223,6 +258,7 @@ mod fallback {
         meta[0] = RecvMeta {
             source,
             len,
+            truncated: false,
             ecn: None,
             dst_ip: None,
             stride: 0,
