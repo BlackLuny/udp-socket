@@ -245,7 +245,10 @@ pub fn recv<I: AsRawFd>(
     let mut hdrs = unsafe { mem::zeroed::<[libc::mmsghdr; BATCH_SIZE]>() };
     let max_msg_count = bufs.len().min(meta.len()).min(BATCH_SIZE);
     if max_msg_count == 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "UDP receive needs a buffer and metadata"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "UDP receive needs a buffer and metadata",
+        ));
     }
     for i in 0..max_msg_count {
         prepare_recv(
@@ -274,8 +277,10 @@ pub fn recv<I: AsRawFd>(
         }
         break n;
     };
+    // A slot without a source address is a kernel/ABI mismatch; fail rather
+    // than invent an address for it.
     for i in 0..(msg_count as usize) {
-        meta[i] = decode_recv(&names[i], &hdrs[i].msg_hdr, hdrs[i].msg_len as usize);
+        meta[i] = decode_recv(&names[i], &hdrs[i].msg_hdr, hdrs[i].msg_len as usize)?;
     }
     Ok(msg_count as usize)
 }
@@ -287,27 +292,45 @@ pub fn recv_datagram<I: AsRawFd>(io: I, buffer: &mut [u8]) -> io::Result<crate::
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let mut name = unsafe { mem::zeroed::<sockaddr_storage>() };
+        let mut len: libc::socklen_t;
         let n = loop {
-            let mut len = mem::size_of_val(&name) as libc::socklen_t;
-            let n = unsafe { libc::recvfrom(io.as_raw_fd(), buffer.as_mut_ptr().cast(),
-                buffer.len(), libc::MSG_TRUNC, (&mut name as *mut sockaddr_storage).cast(), &mut len) };
+            len = mem::size_of_val(&name) as libc::socklen_t;
+            let n = unsafe {
+                libc::recvfrom(
+                    io.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_TRUNC,
+                    (&mut name as *mut sockaddr_storage).cast(),
+                    &mut len,
+                )
+            };
             if n == -1 {
                 let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted { continue; }
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
                 return Err(e);
             }
             break n as usize;
         };
-        let source = sockaddr_storage_to_socketaddr(&name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown UDP source family"))?;
-        Ok(crate::DatagramMeta { source, len: n.min(buffer.len()), truncated: n > buffer.len() })
+        let source = sockaddr_storage_to_socketaddr(&name, len).ok_or_else(missing_source)?;
+        Ok(crate::DatagramMeta {
+            source,
+            len: n.min(buffer.len()),
+            truncated: n > buffer.len(),
+        })
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let mut meta = [RecvMeta::default()];
         recv_one(io, &mut [IoSliceMut::new(buffer)], &mut meta)?;
         let m = meta[0];
-        Ok(crate::DatagramMeta { source: m.source, len: m.len, truncated: m.truncated })
+        Ok(crate::DatagramMeta {
+            source: m.source,
+            len: m.len,
+            truncated: m.truncated,
+        })
     }
 }
 
@@ -318,7 +341,19 @@ pub fn recv_one<I: AsRawFd>(
     meta: &mut [RecvMeta],
 ) -> io::Result<usize> {
     if bufs.is_empty() || meta.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "UDP receive needs a buffer and metadata"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "UDP receive needs a buffer and metadata",
+        ));
+    }
+    // Darwin/BSD set MSG_TRUNC for an empty datagram read into an empty buffer
+    // and leave the record queued without its address; reject before reading.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    if bufs[0].is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "UDP receive needs a non-empty buffer",
+        ));
     }
     let mut name = MaybeUninit::<libc::sockaddr_storage>::uninit();
     let mut ctrl = cmsg::Aligned(MaybeUninit::<[u8; CMSG_LEN]>::uninit());
@@ -335,7 +370,7 @@ pub fn recv_one<I: AsRawFd>(
         }
         break n;
     };
-    meta[0] = decode_recv(&name, &hdr, n as usize);
+    meta[0] = decode_recv(&name, &hdr, n as usize)?;
     Ok(1)
 }
 
@@ -426,21 +461,38 @@ fn prepare_recv(
     hdr.msg_flags = 0;
 }
 
-fn sockaddr_storage_to_socketaddr(storage: &sockaddr_storage) -> Option<SocketAddr> {
+fn missing_source() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "UDP receive returned no usable source address",
+    )
+}
+
+/// `len` is the address length the kernel returned; shorter than the family's
+/// sockaddr means it was not (fully) written.
+fn sockaddr_storage_to_socketaddr(
+    storage: &sockaddr_storage,
+    len: libc::socklen_t,
+) -> Option<SocketAddr> {
+    let len = len as usize;
     unsafe {
         match storage.ss_family as i32 {
-            AF_INET => {
+            AF_INET if len >= mem::size_of::<sockaddr_in>() => {
                 let addr: &sockaddr_in = &*(storage as *const _ as *const sockaddr_in);
                 let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
                 let port = u16::from_be(addr.sin_port);
                 Some(SocketAddr::new(ip.into(), port))
             }
-            AF_INET6 => {
+            AF_INET6 if len >= mem::size_of::<sockaddr_in6>() => {
                 let addr: &sockaddr_in6 = &*(storage as *const _ as *const sockaddr_in6);
                 let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
                 let port = u16::from_be(addr.sin6_port);
-                Some(SocketAddr::V6(std::net::SocketAddrV6::new(ip, port,
-                    addr.sin6_flowinfo, addr.sin6_scope_id)))
+                Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                    ip,
+                    port,
+                    addr.sin6_flowinfo,
+                    addr.sin6_scope_id,
+                )))
             }
             _ => None,
         }
@@ -451,7 +503,12 @@ fn decode_recv(
     name: &MaybeUninit<libc::sockaddr_storage>,
     hdr: &libc::msghdr,
     len: usize,
-) -> RecvMeta {
+) -> io::Result<RecvMeta> {
+    // The kernel wrote only `msg_namelen` bytes; shorter than the smallest
+    // supported sockaddr cannot be decoded and leaves the storage uninitialized.
+    if (hdr.msg_namelen as usize) < mem::size_of::<libc::sockaddr_in>() {
+        return Err(missing_source());
+    }
     let name = unsafe { name.assume_init() };
     let mut ecn_bits = 0;
     let mut dst_ip = None;
@@ -495,16 +552,40 @@ fn decode_recv(
             _ => {}
         }
     }
-    let source = sockaddr_storage_to_socketaddr(&name).unwrap();
+    let source =
+        sockaddr_storage_to_socketaddr(&name, hdr.msg_namelen).ok_or_else(missing_source)?;
 
-    RecvMeta {
+    Ok(RecvMeta {
         source,
         len,
         truncated: hdr.msg_flags & libc::MSG_TRUNC != 0,
         ecn: EcnCodepoint::from_bits(ecn_bits),
         dst_ip,
         stride,
-    }
+    })
+}
+
+/// Whether `UDP_GRO` is enabled. Reports false when the kernel does not
+/// support reading the option back.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn gro_enabled<I: AsRawFd>(io: I) -> bool {
+    let mut value: libc::c_int = 0;
+    let mut len = mem::size_of_val(&value) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            io.as_raw_fd(),
+            libc::SOL_UDP,
+            libc::UDP_GRO,
+            &mut value as *mut _ as _,
+            &mut len,
+        )
+    };
+    rc == 0 && value != 0
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn gro_enabled<I: AsRawFd>(_io: I) -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -541,11 +622,25 @@ mod address_tests {
     #[test]
     fn receive_source_preserves_ipv6_zone_and_flowinfo() {
         let expected = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
-            "fe80::1234".parse().unwrap(), 4321, 17, 9));
+            "fe80::1234".parse().unwrap(),
+            4321,
+            17,
+            9,
+        ));
         let addr = socket2::SockAddr::from(expected);
         let mut storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
-        unsafe { std::ptr::copy_nonoverlapping(addr.as_ptr().cast::<u8>(),
-            (&mut storage as *mut libc::sockaddr_storage).cast::<u8>(), addr.len() as usize); }
-        assert_eq!(super::sockaddr_storage_to_socketaddr(&storage), Some(expected));
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                addr.as_ptr().cast::<u8>(),
+                (&mut storage as *mut libc::sockaddr_storage).cast::<u8>(),
+                addr.len() as usize,
+            );
+        }
+        assert_eq!(
+            super::sockaddr_storage_to_socketaddr(&storage, addr.len()),
+            Some(expected)
+        );
+        // A short address length must not be decoded from stale storage.
+        assert_eq!(super::sockaddr_storage_to_socketaddr(&storage, 0), None);
     }
 }
