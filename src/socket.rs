@@ -19,8 +19,10 @@ use fallback as platform;
 pub struct UdpSocket {
     inner: TokioUdpSocket,
     ty: SocketType,
-    /// Mirrors Linux `UDP_GRO`; `try_read_datagram` cannot split coalesced reads.
-    gro: AtomicBool,
+    /// Linux `UDP_GRO` has been enabled at some point. Sticky: coalesced
+    /// datagrams queued before GRO is disabled stay coalesced, and
+    /// `try_read_datagram` cannot split them.
+    gro_seen: AtomicBool,
 }
 
 impl Deref for UdpSocket {
@@ -65,16 +67,19 @@ impl UdpSocket {
     }
 
     fn from_initialized(socket: std::net::UdpSocket, ty: SocketType) -> Result<Self> {
+        // Tokio requires non-blocking mode; a blocking socket stalls the
+        // runtime thread on a stale readiness event.
+        socket.set_nonblocking(true)?;
         // A caller may have enabled UDP_GRO before handing the socket over.
         #[cfg(unix)]
-        let gro = platform::gro_enabled(socket.as_raw_fd());
+        let gro_seen = platform::gro_enabled(socket.as_raw_fd());
         #[cfg(not(unix))]
-        let gro = false;
+        let gro_seen = false;
         let inner = TokioUdpSocket::from_std(socket)?;
         Ok(Self {
             inner,
             ty,
-            gro: AtomicBool::new(gro),
+            gro_seen: AtomicBool::new(gro_seen),
         })
     }
 
@@ -94,9 +99,17 @@ impl UdpSocket {
     /// On non-Linux platforms this is a no-op and returns `Ok(())`.
     /// Returns the underlying `setsockopt` error on Linux when the kernel
     /// does not support `UDP_GRO` (kernels older than 5.0).
+    ///
+    /// Choose GRO before reading. Disabling it does not split receives already
+    /// coalesced in the queue, and the kernel then stops reporting their
+    /// `stride`; drain or recreate the socket instead of toggling. Once enabled,
+    /// `try_read_datagram` stays refused for the socket's lifetime; calling
+    /// this concurrently with `try_read_datagram` is unsupported.
     pub fn set_gro(&self, enabled: bool) -> Result<()> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
+            // Publish before the kernel can coalesce anything.
+            let was_seen = enabled && self.gro_seen.swap(true, Ordering::SeqCst);
             let on: libc::c_int = if enabled { 1 } else { 0 };
             let rc = unsafe {
                 libc::setsockopt(
@@ -108,9 +121,13 @@ impl UdpSocket {
                 )
             };
             if rc == -1 {
-                return Err(std::io::Error::last_os_error());
+                let err = std::io::Error::last_os_error();
+                if enabled && !was_seen {
+                    // GRO was never on; keep the lightweight path available.
+                    self.gro_seen.store(false, Ordering::SeqCst);
+                }
+                return Err(err);
             }
-            self.gro.store(enabled, Ordering::Relaxed);
         }
         let _ = enabled; // silence unused on non-linux
         Ok(())
@@ -160,19 +177,22 @@ impl UdpSocket {
     /// Receive a datagram with truncation detection, without ancillary metadata.
     /// Use `try_read_one` for ECN, destination IP or GRO.
     ///
-    /// Fails with `Unsupported`, without consuming a datagram, while UDP_GRO is
-    /// enabled: a coalesced read would otherwise look like one datagram.
+    /// Fails with `Unsupported`, without consuming a datagram, once UDP_GRO has
+    /// been enabled on this socket (see `set_gro`): a coalesced read would
+    /// otherwise look like one datagram.
     #[cfg(unix)]
     pub fn try_read_datagram(&self, buffer: &mut [u8]) -> Result<crate::DatagramMeta> {
-        if self.gro.load(Ordering::Relaxed) {
+        if self.gro_seen.load(Ordering::SeqCst) {
             return Err(gro_unsupported());
         }
         Self::try_read_datagram_from(&self.inner, buffer)
     }
 
     /// Same contract as `try_read_datagram`, for an existing Tokio socket.
-    /// Does not change socket options; the caller must keep UDP_GRO disabled.
-    /// Debug builds verify that with an extra `getsockopt` per call.
+    /// Does not change socket options. The caller must guarantee UDP_GRO has
+    /// never been enabled on the socket: datagrams coalesced while it was on
+    /// stay queued after disabling it. Debug builds check only the current
+    /// option, with an extra `getsockopt` per call.
     #[cfg(unix)]
     pub fn try_read_datagram_from(
         socket: &TokioUdpSocket,

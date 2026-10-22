@@ -274,23 +274,72 @@ async fn datagram_read_refuses_gro_sockets_without_consuming() {
         (3, false, &[1, 2, 3][..])
     );
 
+    // Disabling GRO keeps the refusal: see the queued-coalesced test below.
     receiver.set_gro(false).unwrap();
     sender
         .send_to(&[4], receiver.local_addr().unwrap())
         .unwrap();
-    let meta = loop {
-        receiver.readable().await.unwrap();
-        match receiver.try_read_datagram(&mut buf) {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            result => break result.unwrap(),
-        }
-    };
-    assert_eq!((meta.len, meta.truncated, buf[0]), (1, false, 4));
-    receiver.set_gro(true).unwrap();
+    receiver.readable().await.unwrap();
     assert_eq!(
         receiver.try_read_datagram(&mut buf).unwrap_err().kind(),
         std::io::ErrorKind::Unsupported
     );
+    let meta = receiver.recv_one(&mut buf).await.unwrap();
+    assert_eq!((meta.len, meta.truncated, buf[0]), (1, false, 4));
+}
+
+/// Datagrams coalesced while GRO was on stay coalesced in the receive queue
+/// after it is disabled, so the refusal must outlive `set_gro(false)`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn coalesced_datagrams_queued_before_gro_disable_stay_refused() {
+    let receiver = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    receiver.set_gro(true).unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    if UdpSocket::capabilities().unwrap().max_gso_segments < 4 {
+        eprintln!("UDP GSO unavailable on test host; skipped");
+        return;
+    }
+    let transmit = udp_socket::Transmit {
+        destination: receiver.local_addr().unwrap(),
+        ecn: None,
+        contents: vec![7; 4000].into(),
+        segment_size: Some(1000),
+        src_ip: None,
+    };
+    sender.send(std::slice::from_ref(&transmit)).await.unwrap();
+    receiver.set_gro(false).unwrap();
+
+    receiver.readable().await.unwrap();
+    let mut buf = vec![0; 65536];
+    assert_eq!(
+        receiver.try_read_datagram(&mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    // The queued receive is still the coalesced 4 x 1000 bytes, and with GRO
+    // off the kernel no longer reports its stride, so not even the ancillary
+    // path can split it.
+    let meta = receiver.recv_one(&mut buf).await.unwrap();
+    assert_eq!((meta.len, meta.stride, meta.truncated), (4000, 0, false));
+}
+
+/// Tokio requires non-blocking sockets; every constructor must ensure it.
+#[tokio::test]
+async fn constructors_make_the_socket_non_blocking() {
+    use std::os::fd::AsRawFd;
+    let blocking = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    for socket in [
+        UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap(),
+        UdpSocket::from_socket(blocking.into()).unwrap(),
+        UdpSocket::from_socket_with_pmtu(
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into(),
+            udp_socket::PmtuPolicy::Probe,
+        )
+        .unwrap(),
+    ] {
+        let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0);
+    }
 }
 
 /// First IPv6 link-local address with its interface scope, if the host has one.

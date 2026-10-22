@@ -314,7 +314,9 @@ pub fn recv_datagram<I: AsRawFd>(io: I, buffer: &mut [u8]) -> io::Result<crate::
             }
             break n as usize;
         };
-        let source = sockaddr_storage_to_socketaddr(&name, len).ok_or_else(missing_source)?;
+        // SAFETY: `name` is zero-initialized.
+        let source =
+            unsafe { sockaddr_storage_to_socketaddr(&name, len) }.ok_or_else(missing_source)?;
         Ok(crate::DatagramMeta {
             source,
             len: n.min(buffer.len()),
@@ -468,23 +470,31 @@ fn missing_source() -> io::Error {
     )
 }
 
-/// `len` is the address length the kernel returned; shorter than the family's
-/// sockaddr means it was not (fully) written.
-fn sockaddr_storage_to_socketaddr(
-    storage: &sockaddr_storage,
+/// Decodes the source address the kernel wrote into `storage`; `len` is the
+/// address length it returned. Only the family's sockaddr prefix is read, and
+/// only when `len` covers it.
+///
+/// # Safety
+/// The first `len` bytes of `storage` must be initialized; the rest may not be.
+unsafe fn sockaddr_storage_to_socketaddr(
+    storage: *const sockaddr_storage,
     len: libc::socklen_t,
 ) -> Option<SocketAddr> {
     let len = len as usize;
+    // Every supported family's sockaddr covers the family field.
+    if len < mem::size_of::<sockaddr_in>() {
+        return None;
+    }
     unsafe {
-        match storage.ss_family as i32 {
-            AF_INET if len >= mem::size_of::<sockaddr_in>() => {
-                let addr: &sockaddr_in = &*(storage as *const _ as *const sockaddr_in);
+        match ptr::addr_of!((*storage).ss_family).read() as i32 {
+            AF_INET => {
+                let addr = ptr::read(storage as *const sockaddr_in);
                 let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
                 let port = u16::from_be(addr.sin_port);
                 Some(SocketAddr::new(ip.into(), port))
             }
             AF_INET6 if len >= mem::size_of::<sockaddr_in6>() => {
-                let addr: &sockaddr_in6 = &*(storage as *const _ as *const sockaddr_in6);
+                let addr = ptr::read(storage as *const sockaddr_in6);
                 let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
                 let port = u16::from_be(addr.sin6_port);
                 Some(SocketAddr::V6(std::net::SocketAddrV6::new(
@@ -504,12 +514,6 @@ fn decode_recv(
     hdr: &libc::msghdr,
     len: usize,
 ) -> io::Result<RecvMeta> {
-    // The kernel wrote only `msg_namelen` bytes; shorter than the smallest
-    // supported sockaddr cannot be decoded and leaves the storage uninitialized.
-    if (hdr.msg_namelen as usize) < mem::size_of::<libc::sockaddr_in>() {
-        return Err(missing_source());
-    }
-    let name = unsafe { name.assume_init() };
     let mut ecn_bits = 0;
     let mut dst_ip = None;
     // mut is unused on platforms without UDP_GRO (anything but linux/android).
@@ -552,8 +556,10 @@ fn decode_recv(
             _ => {}
         }
     }
-    let source =
-        sockaddr_storage_to_socketaddr(&name, hdr.msg_namelen).ok_or_else(missing_source)?;
+    // SAFETY: the kernel initialized the first `msg_namelen` bytes of `name`;
+    // the rest of the storage is never read.
+    let source = unsafe { sockaddr_storage_to_socketaddr(name.as_ptr(), hdr.msg_namelen) }
+        .ok_or_else(missing_source)?;
 
     Ok(RecvMeta {
         source,
@@ -637,10 +643,13 @@ mod address_tests {
             );
         }
         assert_eq!(
-            super::sockaddr_storage_to_socketaddr(&storage, addr.len()),
+            unsafe { super::sockaddr_storage_to_socketaddr(&storage, addr.len()) },
             Some(expected)
         );
         // A short address length must not be decoded from stale storage.
-        assert_eq!(super::sockaddr_storage_to_socketaddr(&storage, 0), None);
+        assert_eq!(
+            unsafe { super::sockaddr_storage_to_socketaddr(&storage, 0) },
+            None
+        );
     }
 }
