@@ -1,4 +1,19 @@
-use std::{borrow::Cow, net::{IpAddr, Ipv6Addr, SocketAddr}};
+use std::{
+    borrow::Cow,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+};
+
+/// Linux PMTU policy applied once, during final socket initialization.
+///
+/// Only Linux and Android apply it (`IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER`);
+/// other platforms accept and ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PmtuPolicy {
+    /// `IP_PMTUDISC_PROBE`: set DF, ignore the cached path MTU. The default.
+    Probe,
+    /// `IP_PMTUDISC_DONT`: let the kernel fragment oversized datagrams.
+    AllowFragmentation,
+}
 
 /// The capabilities a UDP socket supports on a certain platform.
 #[derive(Clone, Copy, Debug)]
@@ -25,6 +40,16 @@ pub struct Transmit<'a> {
     pub src_ip: Option<IpAddr>,
 }
 
+/// A single datagram on a socket with UDP_GRO disabled, without ancillary data.
+#[derive(Clone, Copy, Debug)]
+pub struct DatagramMeta {
+    pub source: SocketAddr,
+    /// Number of bytes copied to the receive buffer.
+    pub len: usize,
+    /// The original datagram was larger than the receive buffer.
+    pub truncated: bool,
+}
+
 /// An incoming packet
 #[derive(Clone, Copy, Debug)]
 pub struct RecvMeta {
@@ -32,6 +57,12 @@ pub struct RecvMeta {
     pub source: SocketAddr,
     /// Length of the payload of the packet.
     pub len: usize,
+    /// The kernel discarded part of this datagram. `len` is only the copied
+    /// prefix, never a complete UDP payload. Callers must discard this entry.
+    ///
+    /// With `UDP_GRO` enabled the whole coalesced receive is truncated; size
+    /// receive buffers for the largest GRO batch (64 KiB) to avoid this.
+    pub truncated: bool,
     /// Explicit congestion notification bits set on the packet.
     pub ecn: Option<EcnCodepoint>,
     /// Optional destination IP address of the datagram.
@@ -49,6 +80,7 @@ impl Default for RecvMeta {
         Self {
             source: SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
             len: 0,
+            truncated: false,
             ecn: None,
             dst_ip: None,
             stride: 0,

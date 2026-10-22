@@ -5,6 +5,8 @@ use std::io::{IoSliceMut, Result};
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::task::{Context, Poll};
 use tokio::io::Interest;
 use tokio::net::UdpSocket as TokioUdpSocket;
@@ -18,6 +20,14 @@ use fallback as platform;
 pub struct UdpSocket {
     inner: TokioUdpSocket,
     ty: SocketType,
+    /// Linux `UDP_GRO` has been enabled at some point. Sticky: coalesced
+    /// datagrams queued before GRO is disabled stay coalesced, and
+    /// `try_read_datagram` cannot split them.
+    gro_seen: AtomicBool,
+    /// Serializes `set_gro`, so a failed enable cannot roll back `gro_seen`
+    /// after a concurrent enable succeeded. Never taken on the receive path.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+    gro_config: Mutex<()>,
 }
 
 impl Deref for UdpSocket {
@@ -43,15 +53,40 @@ impl UdpSocket {
     pub fn bind(addr: SocketAddr) -> Result<Self> {
         let socket = std::net::UdpSocket::bind(addr)?;
         let ty = platform::init(&socket)?;
-        let inner = TokioUdpSocket::from_std(socket)?;
-        Ok(Self { inner, ty })
+        Self::from_initialized(socket, ty)
     }
 
     pub fn from_socket(socket: Socket) -> Result<Self> {
         let socket = std::net::UdpSocket::from(socket);
         let ty = platform::init(&socket)?;
+        Self::from_initialized(socket, ty)
+    }
+
+    /// Like `from_socket`, with an explicit PMTU policy (Linux/Android only;
+    /// ignored elsewhere).
+    #[cfg(unix)]
+    pub fn from_socket_with_pmtu(socket: Socket, policy: crate::PmtuPolicy) -> Result<Self> {
+        let socket = std::net::UdpSocket::from(socket);
+        let ty = platform::init_with_pmtu(&socket, policy)?;
+        Self::from_initialized(socket, ty)
+    }
+
+    fn from_initialized(socket: std::net::UdpSocket, ty: SocketType) -> Result<Self> {
+        // Tokio requires non-blocking mode; a blocking socket stalls the
+        // runtime thread on a stale readiness event.
+        socket.set_nonblocking(true)?;
+        // A caller may have enabled UDP_GRO before handing the socket over.
+        #[cfg(unix)]
+        let gro_seen = platform::gro_enabled(socket.as_raw_fd());
+        #[cfg(not(unix))]
+        let gro_seen = false;
         let inner = TokioUdpSocket::from_std(socket)?;
-        Ok(Self { inner, ty })
+        Ok(Self {
+            inner,
+            ty,
+            gro_seen: AtomicBool::new(gro_seen),
+            gro_config: Mutex::new(()),
+        })
     }
 
     pub fn socket_type(&self) -> SocketType {
@@ -70,9 +105,18 @@ impl UdpSocket {
     /// On non-Linux platforms this is a no-op and returns `Ok(())`.
     /// Returns the underlying `setsockopt` error on Linux when the kernel
     /// does not support `UDP_GRO` (kernels older than 5.0).
+    ///
+    /// Choose GRO before reading. Disabling it does not split receives already
+    /// coalesced in the queue, and the kernel then stops reporting their
+    /// `stride`; drain or recreate the socket instead of toggling. Once enabled,
+    /// `try_read_datagram` stays refused for the socket's lifetime; calling
+    /// this concurrently with `try_read_datagram` is unsupported.
     pub fn set_gro(&self, enabled: bool) -> Result<()> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
+            let _config = self.gro_config.lock().unwrap_or_else(|e| e.into_inner());
+            // Publish before the kernel can coalesce anything.
+            let was_seen = enabled && self.gro_seen.swap(true, Ordering::SeqCst);
             let on: libc::c_int = if enabled { 1 } else { 0 };
             let rc = unsafe {
                 libc::setsockopt(
@@ -84,7 +128,13 @@ impl UdpSocket {
                 )
             };
             if rc == -1 {
-                return Err(std::io::Error::last_os_error());
+                let err = std::io::Error::last_os_error();
+                if enabled && !was_seen {
+                    // GRO was never on, and `_config` excludes a concurrent
+                    // enable; keep the lightweight path available.
+                    self.gro_seen.store(false, Ordering::SeqCst);
+                }
+                return Err(err);
             }
         }
         let _ = enabled; // silence unused on non-linux
@@ -120,6 +170,8 @@ impl UdpSocket {
             }
         }
     }
+    /// Truncated datagrams are reported with `RecvMeta::truncated` set rather
+    /// than skipped; callers must check the flag.
     pub fn try_read_mmsg(
         &self,
         buffers: &mut [IoSliceMut<'_>],
@@ -128,6 +180,69 @@ impl UdpSocket {
         self.inner.try_io(Interest::READABLE, || {
             platform::recv(self.inner.as_raw_fd(), buffers, meta)
         })
+    }
+
+    /// Receive a datagram with truncation detection, without ancillary metadata.
+    /// Use `try_read_one` for ECN, destination IP or GRO.
+    ///
+    /// Fails with `Unsupported`, without consuming a datagram, once UDP_GRO has
+    /// been enabled on this socket (see `set_gro`): a coalesced read would
+    /// otherwise look like one datagram.
+    #[cfg(unix)]
+    pub fn try_read_datagram(&self, buffer: &mut [u8]) -> Result<crate::DatagramMeta> {
+        if self.gro_seen.load(Ordering::SeqCst) {
+            return Err(gro_unsupported());
+        }
+        Self::try_read_datagram_from(&self.inner, buffer)
+    }
+
+    /// Same contract as `try_read_datagram`, for an existing Tokio socket.
+    /// Does not change socket options. The caller must guarantee UDP_GRO has
+    /// never been enabled on the socket: datagrams coalesced while it was on
+    /// stay queued after disabling it. Debug builds check only the current
+    /// option, with an extra `getsockopt` per call.
+    #[cfg(unix)]
+    pub fn try_read_datagram_from(
+        socket: &TokioUdpSocket,
+        buffer: &mut [u8],
+    ) -> Result<crate::DatagramMeta> {
+        if cfg!(debug_assertions) && platform::gro_enabled(socket.as_raw_fd()) {
+            return Err(gro_unsupported());
+        }
+        socket.try_io(Interest::READABLE, || {
+            platform::recv_datagram(socket.as_raw_fd(), buffer)
+        })
+    }
+
+    /// Receive one datagram without losing the kernel's truncation flag.
+    #[cfg(unix)]
+    pub fn try_read_one(&self, buffer: &mut [u8]) -> Result<RecvMeta> {
+        Self::try_read_one_from(&self.inner, buffer)
+    }
+
+    /// Read flags from an existing Tokio socket without changing its options.
+    #[cfg(unix)]
+    pub fn try_read_one_from(socket: &TokioUdpSocket, buffer: &mut [u8]) -> Result<RecvMeta> {
+        let mut meta = [RecvMeta::default()];
+        socket.try_io(Interest::READABLE, || {
+            platform::recv_one(
+                socket.as_raw_fd(),
+                &mut [IoSliceMut::new(buffer)],
+                &mut meta,
+            )
+        })?;
+        Ok(meta[0])
+    }
+
+    #[cfg(unix)]
+    pub async fn recv_one(&self, buffer: &mut [u8]) -> Result<RecvMeta> {
+        loop {
+            self.inner.readable().await?;
+            match self.try_read_one(buffer) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                result => return result,
+            }
+        }
     }
     pub fn try_write_mmsg(&self, transmits: &[Transmit<'_>]) -> Result<usize> {
         self.inner.try_io(Interest::WRITABLE, || {
@@ -168,6 +283,7 @@ impl UdpSocket {
         Ok(i)
     }
 
+    /// See `try_read_mmsg`: truncated datagrams are reported, not skipped.
     pub async fn recv(
         &self,
         buffers: &mut [IoSliceMut<'_>],
@@ -175,6 +291,14 @@ impl UdpSocket {
     ) -> Result<usize> {
         poll_fn(|cx| self.poll_recv(cx, buffers, meta)).await
     }
+}
+
+#[cfg(unix)]
+fn gro_unsupported() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "try_read_datagram cannot split UDP_GRO reads; use try_read_one",
+    )
 }
 
 #[cfg(not(unix))]
@@ -223,6 +347,7 @@ mod fallback {
         meta[0] = RecvMeta {
             source,
             len,
+            truncated: false,
             ecn: None,
             dst_ip: None,
             stride: 0,
