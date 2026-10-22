@@ -415,3 +415,28 @@ async fn link_local_source_keeps_interface_scope() {
         assert_eq!(source, expected, "mode={mode}");
     }
 }
+
+/// Concurrent GRO toggles never clear the sticky refusal once an enable won.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn concurrent_gro_toggles_keep_refusal_sticky() {
+    let socket = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+    let threads: Vec<_> = (0..8)
+        .map(|i| {
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                for round in 0..200 {
+                    socket.set_gro((i + round) % 2 == 0).unwrap();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let mut buf = [0; 8];
+    assert_eq!(
+        socket.try_read_datagram(&mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+}

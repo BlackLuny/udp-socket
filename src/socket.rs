@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::task::{Context, Poll};
 use tokio::io::Interest;
 use tokio::net::UdpSocket as TokioUdpSocket;
@@ -23,6 +24,10 @@ pub struct UdpSocket {
     /// datagrams queued before GRO is disabled stay coalesced, and
     /// `try_read_datagram` cannot split them.
     gro_seen: AtomicBool,
+    /// Serializes `set_gro`, so a failed enable cannot roll back `gro_seen`
+    /// after a concurrent enable succeeded. Never taken on the receive path.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+    gro_config: Mutex<()>,
 }
 
 impl Deref for UdpSocket {
@@ -80,6 +85,7 @@ impl UdpSocket {
             inner,
             ty,
             gro_seen: AtomicBool::new(gro_seen),
+            gro_config: Mutex::new(()),
         })
     }
 
@@ -108,6 +114,7 @@ impl UdpSocket {
     pub fn set_gro(&self, enabled: bool) -> Result<()> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
+            let _config = self.gro_config.lock().unwrap_or_else(|e| e.into_inner());
             // Publish before the kernel can coalesce anything.
             let was_seen = enabled && self.gro_seen.swap(true, Ordering::SeqCst);
             let on: libc::c_int = if enabled { 1 } else { 0 };
@@ -123,7 +130,8 @@ impl UdpSocket {
             if rc == -1 {
                 let err = std::io::Error::last_os_error();
                 if enabled && !was_seen {
-                    // GRO was never on; keep the lightweight path available.
+                    // GRO was never on, and `_config` excludes a concurrent
+                    // enable; keep the lightweight path available.
                     self.gro_seen.store(false, Ordering::SeqCst);
                 }
                 return Err(err);
